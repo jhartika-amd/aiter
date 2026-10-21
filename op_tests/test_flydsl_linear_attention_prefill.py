@@ -319,6 +319,7 @@ def expand_groups(groups):
 K5_MODELS = {
     "35b": {"label": "Qwen3.5-35B", "Hv": 32},
     "397b": {"label": "Qwen3.5-397B", "Hv": 64},
+    "27b": {"label": "Qwen3.8-27B", "Hv": 48},
 }
 _DENSE_PROMPT_LENS = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
 _VARLEN_SEQLENS = [1024, 2048, 4096, 8192]
@@ -384,11 +385,35 @@ def _k5_varlen_groups(model_name: str, hv: int) -> list[PrefillGroup]:
     return groups
 
 
+def _k5_vllm_groups(model_name: str, hv: int) -> list[PrefillGroup]:
+    """What vLLM's aiter_flydsl backend runs at TP1: varlen, h0 + final state,
+    bf16 snapshots, fp32 state; one long prompt per step or several equal
+    prompts under --max-num-batched-tokens 32768."""
+    return [
+        PrefillGroup(
+            model_name=f"{model_name}-vllm-tp1-single",
+            Hv=hv,
+            tps=[1],
+            full_prompt_lens=[256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
+            max_num_batched_tokens="full_prompt_len",
+        ),
+        PrefillGroup(
+            model_name=f"{model_name}-vllm-tp1-batch",
+            Hv=hv,
+            tps=[1],
+            full_prompt_lens=[1024, 2048, 4096, 8192, 16384],
+            max_num_batched_tokens=[8192, 16384, 32768],
+        ),
+    ]
+
+
 _PREFILL_GROUPS = [
     *_k5_dense_groups(K5_MODELS["35b"]["label"], K5_MODELS["35b"]["Hv"]),
     *_k5_dense_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["35b"]["label"], K5_MODELS["35b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
+    *_k5_varlen_groups(K5_MODELS["27b"]["label"], K5_MODELS["27b"]["Hv"]),
+    *_k5_vllm_groups(K5_MODELS["27b"]["label"], K5_MODELS["27b"]["Hv"]),
 ]
 
 # Full tuner catalog. ``csrc/gdn_k5/chunk_gdn_h_opt_tune.py`` loads this module
