@@ -196,7 +196,12 @@ def build_k5_inputs(case, snapshot_dtype, seed=0):
 
 
 def bench_us(args, bv: int, warmup: int, iters: int) -> float:
+    # The op reads FLYDSL_K5_OPT_BV once at import (_OPT_BV_ENV), so setting the
+    # env var here alone would time the rule's BV for every candidate.
+    from aiter.ops.flydsl import linear_attention_prefill_kernels as _op
+
     os.environ["FLYDSL_K5_OPT_BV"] = str(bv)
+    _op._OPT_BV_ENV = str(bv)
     try:
         for _ in range(warmup):
             k5(**args)
@@ -211,6 +216,7 @@ def bench_us(args, bv: int, warmup: int, iters: int) -> float:
         return statistics.median(s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends))
     finally:
         os.environ.pop("FLYDSL_K5_OPT_BV", None)
+        _op._OPT_BV_ENV = None
 
 
 def lookup_key_from_case(
