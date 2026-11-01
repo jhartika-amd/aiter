@@ -19,6 +19,20 @@ python3 csrc/gdn_k5/chunk_gdn_h_opt_tune.py \
   --run_config aiter/configs/model_configs/qwen3_5_397b_chunk_gdn_h_opt_tuned.csv
 ```
 
-Options: `-i`/`-o`, `--run_config`, `--compare --update_improved`, `--case REGEX ...`, `--list-cases`.
+Options: `-i`/`-o`, `--run_config`, `--compare --update_improved`, `--case REGEX ...`, `--list-cases`,
+`--single-seq-chunks LO:HI`, `--min-gain-pct P`.
+
+- `--single-seq-chunks LO:HI` adds one varlen sequence of every chunk count in `LO..HI` (TP1, h0 + final state,
+  bf16 snapshots, fp32 state: what vLLM's `aiter_flydsl` backend runs for a single prompt chunk) for each varlen
+  shape in `-i`. The case catalog has only a few prompt lengths, and the winning BV can change at any chunk count.
+  `--run_config` rebuilds these cases from the tuned rows.
+- `--min-gain-pct P` writes a row only when the best BV beats the CU/LDS rule's BV by at least `P` percent, so the
+  table carries real overrides only (the rule depends on the CU count, so it is re-checked on each GPU).
+
+```bash
+# Per-GPU table for one model, e.g. Qwen3.8-27B on a 128-CU gfx950: single prompts up to 32768 tokens
+# plus the catalog's batched cases, keeping rows that beat the rule by >= 2%
+python3 csrc/gdn_k5/chunk_gdn_h_opt_tune.py   -i aiter/configs/model_configs/qwen3_8_27b_chunk_gdn_h_opt_untuned.csv   -o /tmp/qwen3_8_27b_chunk_gdn_h_opt_tuned.candidate.csv   --case 'Qwen3.8-27B-vllm-tp1|single-H48' --single-seq-chunks 1:512 --min-gain-pct 2
+```
 
 Missing tuned lookup keys fall back to the CU/LDS BV rule until new rows are merged.

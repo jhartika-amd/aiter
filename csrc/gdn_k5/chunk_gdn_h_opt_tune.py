@@ -91,14 +91,99 @@ def _resolve_tuned_config_for_read(path: str) -> str:
     return AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE
 
 
+_K5_CASES_MODULE = None
+
+
+def _load_k5_module():
+    global _K5_CASES_MODULE
+    if _K5_CASES_MODULE is None:
+        spec = importlib.util.spec_from_file_location(
+            "_gdn_k5_prefill_cases", _K5_TEST_PATH
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _K5_CASES_MODULE = module
+    return _K5_CASES_MODULE
+
+
 def load_k5_cases():
-    spec = importlib.util.spec_from_file_location(
-        "_gdn_k5_prefill_cases", _K5_TEST_PATH
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    module = _load_k5_module()
     return list(zip(module.PREFILL_TEST_IDS, module.PREFILL_PARAMS, strict=True))
+
+
+def _single_seq_case(K, V, BT, H, Hg, output_final_state, t_flat):
+    """One varlen sequence of ``t_flat`` tokens at TP1, as vLLM's
+    aiter_flydsl backend runs a single prompt chunk (h0 + bf16 snapshots,
+    fp32 state)."""
+    module = _load_k5_module()
+    return module.PrefillArgs(
+        K=K,
+        V=V,
+        Hk=Hg,
+        Hv=H,
+        tp=1,
+        full_prompt_len=t_flat,
+        model_name=f"single-H{H}-Hg{Hg}",
+        BT=BT,
+        max_num_batched_tokens=t_flat,
+        is_varlen=True,
+        output_final_state=output_final_state,
+    )
+
+
+def parse_chunk_range(value: str) -> tuple[int, int]:
+    lo, sep, hi = value.partition(":")
+    if not sep:
+        lo = hi = value
+    lo_i, hi_i = int(lo), int(hi)
+    if lo_i < 1 or hi_i < lo_i:
+        raise ValueError(
+            f"bad chunk range {value!r}; expected LO:HI with 1 <= LO <= HI"
+        )
+    return lo_i, hi_i
+
+
+def single_seq_cases(untuned_rows, chunk_range: tuple[int, int]):
+    """Single-sequence varlen cases for every chunk count in ``chunk_range``,
+    one set per varlen untuned shape row. The case catalog only has a few
+    prompt lengths; the BV that wins can change at any chunk count."""
+    lo, hi = chunk_range
+    out = []
+    for row in untuned_rows:
+        if not bool_cell(row["is_varlen"]):
+            continue
+        bt = int(row.get("BT") or 64)
+        for chunks in range(lo, hi + 1):
+            case = _single_seq_case(
+                int(row["K"]),
+                int(row["V"]),
+                bt,
+                int(row["H"]),
+                int(row["Hg"]),
+                bool_cell(row["store_fs"]),
+                chunks * bt,
+            )
+            out.append((repr(case), case))
+    return out
+
+
+def case_from_tuned_row(row: dict[str, Any]):
+    """Rebuild a single-sequence varlen case from a tuned row, for rows that
+    no catalog case produces (e.g. from ``--single-seq-chunks``)."""
+    if int(row["N"]) != 1 or not bool_cell(row["is_varlen"]):
+        return None
+    if not bool_cell(row["snapshot_bf16"]) or bool_cell(row["state_bf16"]):
+        return None  # _single_seq_case builds bf16 snapshots, fp32 state
+    return _single_seq_case(
+        int(row["K"]),
+        int(row["V"]),
+        int(row.get("BT") or 64),
+        int(row["H"]),
+        int(row["Hg"]),
+        bool_cell(row["store_fs"]),
+        int(row["T_flat"]),
+    )
 
 
 def read_csv_rows(path: str) -> list[dict[str, str]]:
@@ -282,7 +367,15 @@ def sweep_case_row(
     *,
     gfx: str,
     cu_num: int,
+    min_gain_pct: float = 0.0,
+    below_gain: list | None = None,
 ) -> dict[str, Any] | None:
+    """Time every BV candidate; return the winner's tuned row, or None.
+
+    With ``min_gain_pct`` > 0 a row is only returned when the winner beats
+    the CU/LDS rule's BV by at least that much (the case id is appended to
+    ``below_gain`` otherwise), so the table only carries real overrides.
+    """
     if case.K != 128 or case.V != 128 or case.BT != 64:
         print(f"{case_id:58s} skipped (kernel supports K=V=128, BT=64 only)")
         return None
@@ -307,7 +400,15 @@ def sweep_case_row(
     )
     gain = (times[rule] - times[best]) / times[rule] * 100 if rule in times else 0.0
     cells = " ".join(f"{times.get(bv, float('nan')):8.1f}" for bv in BV_CANDIDATES)
-    print(f"{case_id:58s} {total_chunks:7d} {cells} {best:5d} {rule:5d} {gain:6.1f}")
+    keep = min_gain_pct <= 0 or gain >= min_gain_pct
+    print(
+        f"{case_id:58s} {total_chunks:7d} {cells} {best:5d} {rule:5d} {gain:6.1f}"
+        + ("" if keep else "  (below --min-gain-pct, not written)")
+    )
+    if not keep:
+        if below_gain is not None:
+            below_gain.append(case_id)
+        return None
 
     return case_to_tuned_row(
         case,
@@ -345,6 +446,9 @@ def find_case_for_row(cases, row: dict[str, Any]):
     for _, case in cases:
         if case_matches_row(case, row):
             return case
+    case = case_from_tuned_row(row)
+    if case is not None and case_matches_row(case, row):
+        return case
     return None
 
 
@@ -385,6 +489,7 @@ class K5BvTuner(TunerCommon):
         "iters": 20,
         "batch": 100,
         "sort": False,
+        "min_gain_pct": 0.0,
     }
 
     def __init__(self):
@@ -396,6 +501,7 @@ class K5BvTuner(TunerCommon):
         )
         self._cases: list[tuple[str, Any]] = []
         self._case_by_id: dict[str, Any] = {}
+        self._below_gain: list[str] = []
         self.run_config_failed = False
 
     def _clear_op_caches(self):
@@ -426,6 +532,23 @@ class K5BvTuner(TunerCommon):
             action="store_true",
             help="print PrefillGroup case ids and exit",
         )
+        self.parser.add_argument(
+            "--single-seq-chunks",
+            type=parse_chunk_range,
+            default=None,
+            metavar="LO:HI",
+            help="also tune one varlen sequence of every chunk count in LO..HI "
+            "(TP1, h0 + final state, bf16 snapshots, fp32 state) for each "
+            "varlen shape in -i, e.g. 1:512 for prompts up to 32768 tokens",
+        )
+        self.parser.add_argument(
+            "--min-gain-pct",
+            dest="min_gain_pct",
+            type=float,
+            default=self.get_arg_defaults()["min_gain_pct"],
+            help="write a row only when the best BV beats the CU/LDS rule's BV "
+            "by at least this percent (default 0: write every tuned row)",
+        )
 
     def pre_process(self, args):
         self._gfx = get_gfx_runtime()
@@ -435,7 +558,10 @@ class K5BvTuner(TunerCommon):
             return
 
         untuned_rows = read_csv_rows(args.untune_file)
-        self._cases = select_cases(load_k5_cases(), untuned_rows, args.case)
+        cases = load_k5_cases()
+        if args.single_seq_chunks:
+            cases += single_seq_cases(untuned_rows, args.single_seq_chunks)
+        self._cases = select_cases(cases, untuned_rows, args.case)
         self._case_by_id = {case_id: case for case_id, case in self._cases}
         tuned_read = _resolve_tuned_config_for_read(args.tune_file)
 
@@ -447,6 +573,10 @@ class K5BvTuner(TunerCommon):
         self.untunedf = dataframe_from_cases(
             self._cases, gfx=self._gfx, cu_num=self._cu_num
         )
+        # Catalog and --single-seq-chunks cases can share a lookup key.
+        self.untunedf = self.untunedf.drop_duplicates(
+            subset=list(self.keys)
+        ).reset_index(drop=True)
         self.tunedf = self.get_tuned_gemm_list(tuned_read)
 
         if self.tunedf is not None and not self.tunedf.empty:
@@ -486,6 +616,8 @@ class K5BvTuner(TunerCommon):
                 args.iters,
                 gfx=self._gfx,
                 cu_num=self._cu_num,
+                min_gain_pct=args.min_gain_pct,
+                below_gain=self._below_gain,
             )
             if tuned_row is None:
                 continue
@@ -643,7 +775,16 @@ class K5BvTuner(TunerCommon):
             logger.info("Failed shapes:")
             print(self.failed, flush=True)
             sys.exit(1)
-        if self.success.empty and not self.untunedf.empty:
+        if self._below_gain:
+            logger.info(
+                f"{len(self._below_gain)} shapes not written: the CU/LDS rule's BV "
+                "is within --min-gain-pct of the best"
+            )
+        if (
+            self.success.empty
+            and not self.untunedf.empty
+            and len(self._below_gain) < len(self.untunedf)
+        ):
             logger.error("\033[91m[Tuning not Finished]\033[0m no shapes were tuned")
             sys.exit(1)
 
